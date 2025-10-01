@@ -1,8 +1,8 @@
 [Unit]
 Description=LXD DNS Lookup Service
-After=network.target network-online.target lxd.service
+After=network.target network-online.target snap.lxd.daemon.service
 Wants=network-online.target
-Requires=lxd.service
+Requires=snap.lxd.daemon.service
 
 [Service]
 Type=exec
