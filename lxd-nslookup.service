@@ -1,6 +1,5 @@
 [Unit]
 Description=LXD DNS Lookup Service
-Documentation=https://github.com/vibfolks/lxd-nslookup
 After=network.target network-online.target lxd.service
 Wants=network-online.target
 Requires=lxd.service
@@ -9,8 +8,8 @@ Requires=lxd.service
 Type=exec
 User=lxd
 Group=lxd
-WorkingDirectory=/opt/lxd-nslookup
-ExecStart=/opt/lxd-nslookup/.venv/bin/python lxd_nslookup.py -c /etc/lxd_nslookup.yml
+WorkingDirectory=/run/lxd_nslookup
+ExecStart=/usr/local/bin/lxd_nslookupd -c /etc/lxd_nslookup.yml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
@@ -21,7 +20,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/log/lxd-nslookup
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
