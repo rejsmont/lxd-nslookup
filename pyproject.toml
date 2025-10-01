@@ -1,0 +1,20 @@
+[project]
+name = "lxd-nslookup"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "Radoslaw Kamil Ejsmont",email = "radoslaw@ejsmont.net"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pylxd (>=2.3.5,<3.0.0)",
+    "fastapi (>=0.118.0,<0.119.0)",
+    "uvicorn (>=0.37.0,<0.38.0)",
+    "pyyaml (>=6.0,<7.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

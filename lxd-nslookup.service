@@ -1,0 +1,47 @@
+[Unit]
+Description=LXD DNS Lookup Service
+Documentation=https://github.com/vibfolks/lxd-nslookup
+After=network.target network-online.target lxd.service
+Wants=network-online.target
+Requires=lxd.service
+
+[Service]
+Type=exec
+User=lxd
+Group=lxd
+WorkingDirectory=/opt/lxd-nslookup
+ExecStart=/opt/lxd-nslookup/.venv/bin/python lxd_nslookup.py -c /etc/lxd_nslookup.yml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/lxd-nslookup
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+
+# Network restrictions
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAccounting=true
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lxd-nslookup
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target
