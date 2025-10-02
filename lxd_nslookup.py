@@ -139,7 +139,7 @@ def get_container_ip(container_name, interface=None, family='inet'):
     return None
 
 
-async def perform_dns_lookup(qname: str, qtype: str, request: Request = None):
+def perform_dns_lookup(qname: str, qtype: str):
     """
     Perform DNS lookup for the given query name and type.
     
@@ -150,10 +150,6 @@ async def perform_dns_lookup(qname: str, qtype: str, request: Request = None):
     Returns:
         list: List of DNS answer dictionaries
     """
-    qname = qname.rstrip(".")
-    
-    print(f"Performing lookup for {qname} (type: {qtype})")
-    print(f"Request body: {await request.body() if request else 'N/A'}")
 
     if qtype == "SOA":
         for domain in config.get('domains', ['lxd']):
@@ -183,6 +179,7 @@ async def perform_dns_lookup(qname: str, qtype: str, request: Request = None):
         print(f"No matching domain for SOA query: {qname}")
         return {"result": []}
 
+    qname = qname.rstrip(".")
     cname = None
     for suffix in config.get('domains', ['lxd']):
         if qname.endswith(suffix):
@@ -218,7 +215,7 @@ async def perform_dns_lookup(qname: str, qtype: str, request: Request = None):
 
 
 @app.get("/lookup/{qname:path}/{qtype}")
-async def lookup_restful(qname: str, qtype: str):
+async def lookup_restful(qname: str, qtype: str, request: Request = None):
     """
     RESTful GET endpoint for DNS lookup requests for LXD containers.
     
@@ -232,6 +229,9 @@ async def lookup_restful(qname: str, qtype: str):
     Returns:
         list: List of DNS answer dictionaries, same format as POST endpoint
     """
+    print(f"Performing lookup for {qname} (type: {qtype})")
+    print(f"Request body: {await request.body() if request else 'N/A'}")
+
     return perform_dns_lookup(qname, qtype)
 
 
