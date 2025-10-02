@@ -139,7 +139,7 @@ def get_container_ip(container_name, interface=None, family='inet'):
     return None
 
 
-def perform_dns_lookup(qname: str, qtype: str):
+async def perform_dns_lookup(qname: str, qtype: str, request: Request = None):
     """
     Perform DNS lookup for the given query name and type.
     
@@ -153,6 +153,7 @@ def perform_dns_lookup(qname: str, qtype: str):
     qname = qname.rstrip(".")
     
     print(f"Performing lookup for {qname} (type: {qtype})")
+    print(f"Request body: {await request.body() if request else 'N/A'}")
 
     if qtype == "SOA":
         for domain in config.get('domains', ['lxd']):
@@ -177,10 +178,10 @@ def perform_dns_lookup(qname: str, qtype: str):
                 }]
 
                 print(f"Returning SOA record: {response}")
-                return response
+                return {"result": response}
         
         print(f"No matching domain for SOA query: {qname}")
-        return []
+        return {"result": []}
 
     cname = None
     for suffix in config.get('domains', ['lxd']):
@@ -213,53 +214,7 @@ def perform_dns_lookup(qname: str, qtype: str):
         })
 
     print(f"Returning answers: {answers}")
-    return answers
-
-
-@app.post("/lookup")
-async def lookup(request: Request):
-    """
-    FastAPI endpoint for DNS lookup requests for LXD containers.
-    
-    This endpoint handles DNS queries for container names, returning appropriate
-    A (IPv4), AAAA (IPv6), or SOA (Start of Authority) records based on the query type 
-    and configured domain suffixes.
-    
-    Args:
-        request (Request): FastAPI request object containing form data or JSON payload
-    
-    Returns:
-        list: List of DNS answer dictionaries, each containing:
-            - qtype (str): Query type ('A', 'AAAA', or 'SOA')
-            - qname (str): Queried domain name
-            - content (str): IP address or SOA record content
-            - ttl (int): Time to live in seconds
-            - auth (bool): Authoritative response flag
-    """
-    
-    body = await request.body()
-    
-    # Try to parse as form data first (PowerDNS format)
-    try:
-        body_str = body.decode('utf-8')
-        if body_str.startswith('parameters='):
-            # Parse URL-encoded form data
-            parsed_data = urllib.parse.parse_qs(body_str)
-            parameters_json = parsed_data['parameters'][0]
-            data = json.loads(parameters_json)
-            print(f"Parsed form data: {data}")
-        else:
-            # Try to parse as JSON
-            data = json.loads(body_str)
-            print(f"Parsed JSON data: {data}")
-    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
-        print(f"Error parsing request body: {e}")
-        return []
-    
-    qname = data.get("qname", "")
-    qtype = data.get("qtype", "A")
-    
-    return perform_dns_lookup(qname, qtype)
+    return {"result": answers}
 
 
 @app.get("/lookup/{qname:path}/{qtype}")
