@@ -139,6 +139,83 @@ def get_container_ip(container_name, interface=None, family='inet'):
     return None
 
 
+def perform_dns_lookup(qname: str, qtype: str):
+    """
+    Perform DNS lookup for the given query name and type.
+    
+    Args:
+        qname (str): Query name (domain name)
+        qtype (str): Query type ('A', 'AAAA', 'SOA')
+    
+    Returns:
+        list: List of DNS answer dictionaries
+    """
+    qname = qname.rstrip(".")
+    
+    print(f"Performing lookup for {qname} (type: {qtype})")
+
+    if qtype == "SOA":
+        for domain in config.get('domains', ['lxd']):
+            if qname == domain or qname.endswith('.' + domain):
+                soa_config = config.get('soa', {})
+                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}')
+                admin_email = soa_config.get('admin_email', f'admin.{domain}')
+                serial = str(int(datetime.now().timestamp()))
+                refresh = soa_config.get('refresh', 3600)
+                retry = soa_config.get('retry', 1800)
+                expire = soa_config.get('expire', 604800)
+                minimum = soa_config.get('minimum', 86400)
+                
+                soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
+                
+                response = [{
+                    "qtype": "SOA",
+                    "qname": qname,
+                    "content": soa_content,
+                    "ttl": 86400,
+                    "auth": True
+                }]
+
+                print(f"Returning SOA record: {response}")
+                return response
+        
+        print(f"No matching domain for SOA query: {qname}")
+        return []
+
+    cname = None
+    for suffix in config.get('domains', ['lxd']):
+        if qname.endswith(suffix):
+            cname = qname[:-len(suffix)].rstrip(".")
+            break
+    
+    if cname is None:
+        print(f"No matching domain suffix for: {qname}")
+        return []
+    
+    ipv4, ipv6 = None, None
+    answers = []
+
+    if qtype == "A" and (ipv4 := get_container_ip(cname, family='inet')):
+        answers.append({
+            "qtype": "A",
+            "qname": qname,
+            "content": ipv4,
+            "ttl": 60,
+            "auth": True
+        })
+    elif qtype == "AAAA" and (ipv6 := get_container_ip(cname, family='inet6')):
+        answers.append({
+            "qtype": "AAAA",
+            "qname": qname,
+            "content": ipv6,
+            "ttl": 60,
+            "auth": True
+        })
+
+    print(f"Returning answers: {answers}")
+    return answers
+
+
 @app.post("/lookup")
 async def lookup(request: Request):
     """
@@ -179,68 +256,28 @@ async def lookup(request: Request):
         print(f"Error parsing request body: {e}")
         return []
     
-    qname = data.get("qname", "").rstrip(".")
+    qname = data.get("qname", "")
     qtype = data.get("qtype", "A")
-
-    if qtype == "SOA":
-        for domain in config.get('domains', ['lxd']):
-            if qname == domain or qname.endswith('.' + domain):
-                soa_config = config.get('soa', {})
-                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}')
-                admin_email = soa_config.get('admin_email', f'admin.{domain}')
-                serial = str(int(datetime.now().timestamp()))
-                refresh = soa_config.get('refresh', 3600)
-                retry = soa_config.get('retry', 1800)
-                expire = soa_config.get('expire', 604800)
-                minimum = soa_config.get('minimum', 86400)
-                
-                soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
-                
-                response = [{
-                    "qtype": "SOA",
-                    "qname": qname,
-                    "content": soa_content,
-                    "ttl": 86400,
-                    "auth": True
-                }]
-
-                print(f"Returning SOA record: {response}")
-                return response
-        
-        print(f"No matching domain for SOA query: {qname}")
-        return []
-
-    cname = None
-    for suffix in config.get('domains', ['lxd']):
-        if qname.endswith(suffix):
-            cname = qname[:-len(suffix)].rstrip(".")
-            break
     
-    if cname is None:
-        return []
+    return perform_dns_lookup(qname, qtype)
+
+
+@app.get("/lookup/{qname:path}/{qtype}")
+async def lookup_restful(qname: str, qtype: str):
+    """
+    RESTful GET endpoint for DNS lookup requests for LXD containers.
     
-    ipv4, ipv6 = None, None
-    answers = []
-
-    if qtype == "A" and (ipv4 := get_container_ip(cname, family='inet')):
-        answers.append({
-            "qtype": "A",
-            "qname": qname,
-            "content": ipv4,
-            "ttl": 60,
-            "auth": True
-        })
-    elif qtype == "AAAA" and (ipv6 := get_container_ip(cname, family='inet6')):
-        answers.append({
-            "qtype": "AAAA",
-            "qname": qname,
-            "content": ipv6,
-            "ttl": 60,
-            "auth": True
-        })
-
-    print(f"Returning answers: {answers}")
-    return answers
+    This endpoint handles DNS queries via URL path parameters, supporting
+    URLs like: GET /lookup/db-srv-a1.lxd./SOA
+    
+    Args:
+        qname (str): Query name (domain name) from URL path
+        qtype (str): Query type ('A', 'AAAA', 'SOA') from URL path
+    
+    Returns:
+        list: List of DNS answer dictionaries, same format as POST endpoint
+    """
+    return perform_dns_lookup(qname, qtype)
 
 
 if __name__ == "__main__":
