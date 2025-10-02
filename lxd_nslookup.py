@@ -7,6 +7,13 @@ from datetime import datetime
 from fastapi import FastAPI, Request
 import uvicorn
 import pylxd
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    category=UserWarning,
+    module="pylxd.models._model"
+)
 
 app = FastAPI()
 config = {}
