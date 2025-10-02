@@ -235,6 +235,20 @@ async def lookup_restful(qname: str, qtype: str, request: Request = None):
     return perform_dns_lookup(qname, qtype)
 
 
+@app.get("/getAllDomainMetadata/{qname:path}")
+async def get_all_domain_metadata(qname: str):
+    """
+    RESTful GET endpoint for retrieving all metadata for a specific domain.
+
+    Args:
+        qname (str): Query name (domain name) from URL path
+
+    Returns:
+        dict: Metadata information for the specified domain
+    """
+    return {"result": []} 
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='LXD DNS lookup service')
     parser.add_argument('-c', '--config', 
