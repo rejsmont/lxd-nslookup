@@ -129,8 +129,10 @@ def get_container_ip(container_name, interface=None, family='inet'):
         if addr.get("scope") == "link":
             continue
         ip = addr.get("address")
+        print(f"Found address {ip} for container {container_name} on interface {interface}")
         if family == 'inet6' and is_slaac(ip):
             slaac = ip
+            continue
         return ip
     
     if slaac is not None:
