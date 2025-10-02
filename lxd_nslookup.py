@@ -193,7 +193,7 @@ def perform_dns_lookup(qname: str, qtype: str):
     ipv4, ipv6 = None, None
     answers = []
 
-    if qtype == "A" and (ipv4 := get_container_ip(cname, family='inet')):
+    if (qtype == "A" or qtype == "ANY") and (ipv4 := get_container_ip(cname, family='inet')):
         answers.append({
             "qtype": "A",
             "qname": qname + ".",
@@ -201,7 +201,7 @@ def perform_dns_lookup(qname: str, qtype: str):
             "ttl": 60,
             "auth": True
         })
-    elif qtype == "AAAA" and (ipv6 := get_container_ip(cname, family='inet6')):
+    if (qtype == "AAAA" or qtype == "ANY") and (ipv6 := get_container_ip(cname, family='inet6')):
         answers.append({
             "qtype": "AAAA",
             "qname": qname + ".",
