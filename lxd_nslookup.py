@@ -6,6 +6,8 @@ import yaml
 from fastapi import FastAPI, Request
 import uvicorn
 import pylxd
+import urllib.parse
+import json
 
 app = FastAPI()
 config = {}
@@ -136,7 +138,7 @@ async def lookup(request: Request):
     domain suffixes.
     
     Args:
-        request (Request): FastAPI request object containing JSON payload
+        request (Request): FastAPI request object containing form data or JSON payload
     
     Returns:
         list: List of DNS answer dictionaries, each containing:
@@ -146,7 +148,26 @@ async def lookup(request: Request):
             - ttl (int): Time to live in seconds
             - auth (bool): Authoritative response flag
     """
-    data = await request.json()
+    
+    body = await request.body()
+    
+    # Try to parse as form data first (PowerDNS format)
+    try:
+        body_str = body.decode('utf-8')
+        if body_str.startswith('parameters='):
+            # Parse URL-encoded form data
+            parsed_data = urllib.parse.parse_qs(body_str)
+            parameters_json = parsed_data['parameters'][0]
+            data = json.loads(parameters_json)
+            print(f"Parsed form data: {data}")
+        else:
+            # Try to parse as JSON
+            data = json.loads(body_str)
+            print(f"Parsed JSON data: {data}")
+    except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
+        print(f"Error parsing request body: {e}")
+        return []
+    
     qname = data.get("qname", "").rstrip(".")
     qtype = data.get("qtype", "A")
 
