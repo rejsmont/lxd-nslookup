@@ -196,14 +196,18 @@ async def lookup(request: Request):
                 
                 soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
                 
-                return [{
+                response = [{
                     "qtype": "SOA",
                     "qname": qname,
                     "content": soa_content,
                     "ttl": 86400,
                     "auth": True
                 }]
+
+                print(f"Returning SOA record: {response}")
+                return response
         
+        print(f"No matching domain for SOA query: {qname}")
         return []
 
     cname = None
@@ -235,6 +239,7 @@ async def lookup(request: Request):
             "auth": True
         })
 
+    print(f"Returning answers: {answers}")
     return answers
 
 
