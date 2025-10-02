@@ -7,8 +7,6 @@ from datetime import datetime
 from fastapi import FastAPI, Request
 import uvicorn
 import pylxd
-import urllib.parse
-import json
 
 app = FastAPI()
 config = {}
@@ -129,7 +127,6 @@ def get_container_ip(container_name, interface=None, family='inet'):
         if addr.get("scope") == "link":
             continue
         ip = addr.get("address")
-        print(f"Found address {ip} for container {container_name} on interface {interface}")
         if family == 'inet6' and is_slaac(ip):
             slaac = ip
             continue
@@ -176,10 +173,8 @@ def perform_dns_lookup(qname: str, qtype: str):
                     "auth": True
                 }]
 
-                print(f"Returning SOA record: {response}")
                 return {"result": response}
         
-        print(f"No matching domain for SOA query: {qname}")
         return {"result": []}
 
     cname = None
@@ -189,7 +184,6 @@ def perform_dns_lookup(qname: str, qtype: str):
             break
     
     if cname is None:
-        print(f"No matching domain suffix for: {qname}")
         return []
     
     ipv4, ipv6 = None, None
@@ -212,7 +206,6 @@ def perform_dns_lookup(qname: str, qtype: str):
             "auth": True
         })
 
-    print(f"Returning answers: {answers}")
     return {"result": answers}
 
 
@@ -231,8 +224,6 @@ async def lookup_restful(qname: str, qtype: str, request: Request = None):
     Returns:
         list: List of DNS answer dictionaries, same format as POST endpoint
     """
-    print(f"Performing lookup for {qname} (type: {qtype})")
-    print(f"Request body: {await request.body() if request else 'N/A'}")
 
     return perform_dns_lookup(qname, qtype)
 
@@ -266,5 +257,4 @@ if __name__ == "__main__":
     host = server_config.get('host', '127.0.0.1')
     port = server_config.get('port', 8081)
     
-    print(f"Starting server on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
