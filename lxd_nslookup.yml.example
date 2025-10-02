@@ -19,3 +19,14 @@ domains: ['lxd', 'lxd.example.org']
 
 # Network interface to scan for container IP addresses
 interface: 'eth0'
+
+# SOA (Start of Authority) record configuration
+# Used when responding to SOA queries for the managed domains
+soa:
+  primary_ns: 'ns1.lxd.example.org'     # Primary nameserver
+  admin_email: 'admin.lxd.example.org'  # Admin email (replace @ with .)
+  # Note: serial is auto-generated from current timestamp
+  refresh: 3600                         # Refresh interval (1 hour)
+  retry: 1800                          # Retry interval (30 minutes)
+  expire: 604800                       # Expire time (1 week)
+  minimum: 86400                       # Minimum TTL (1 day)

@@ -3,6 +3,7 @@ import ipaddress
 import argparse
 import sys
 import yaml
+from datetime import datetime
 from fastapi import FastAPI, Request
 import uvicorn
 import pylxd
@@ -32,6 +33,16 @@ def load_config(config_file):
         server:
             host: IP address to bind the server to (default: 127.0.0.1)
             port: Port number to bind the server to (default: 8081)
+        domains:
+            - List of domain suffixes to handle (default: ['lxd'])
+        soa:
+            primary_ns: Primary nameserver for SOA record (default: ns1.{domain})
+            admin_email: Admin email for SOA record (default: admin.{domain})
+            serial: Auto-generated from current Unix timestamp
+            refresh: Refresh interval in seconds (default: 3600)
+            retry: Retry interval in seconds (default: 1800)
+            expire: Expire time in seconds (default: 604800)
+            minimum: Minimum TTL in seconds (default: 86400)
     """
     global config, client
     
@@ -134,17 +145,17 @@ async def lookup(request: Request):
     FastAPI endpoint for DNS lookup requests for LXD containers.
     
     This endpoint handles DNS queries for container names, returning appropriate
-    A (IPv4) or AAAA (IPv6) records based on the query type and configured
-    domain suffixes.
+    A (IPv4), AAAA (IPv6), or SOA (Start of Authority) records based on the query type 
+    and configured domain suffixes.
     
     Args:
         request (Request): FastAPI request object containing form data or JSON payload
     
     Returns:
         list: List of DNS answer dictionaries, each containing:
-            - qtype (str): Query type ('A' or 'AAAA')
+            - qtype (str): Query type ('A', 'AAAA', or 'SOA')
             - qname (str): Queried domain name
-            - content (str): IP address
+            - content (str): IP address or SOA record content
             - ttl (int): Time to live in seconds
             - auth (bool): Authoritative response flag
     """
@@ -170,6 +181,30 @@ async def lookup(request: Request):
     
     qname = data.get("qname", "").rstrip(".")
     qtype = data.get("qtype", "A")
+
+    if qtype == "SOA":
+        for domain in config.get('domains', ['lxd']):
+            if qname == domain or qname.endswith('.' + domain):
+                soa_config = config.get('soa', {})
+                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}')
+                admin_email = soa_config.get('admin_email', f'admin.{domain}')
+                serial = str(int(datetime.now().timestamp()))
+                refresh = soa_config.get('refresh', 3600)
+                retry = soa_config.get('retry', 1800)
+                expire = soa_config.get('expire', 604800)
+                minimum = soa_config.get('minimum', 86400)
+                
+                soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
+                
+                return [{
+                    "qtype": "SOA",
+                    "qname": qname,
+                    "content": soa_content,
+                    "ttl": 86400,
+                    "auth": True
+                }]
+        
+        return []
 
     cname = None
     for suffix in config.get('domains', ['lxd']):
