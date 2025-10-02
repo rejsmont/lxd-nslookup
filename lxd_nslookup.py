@@ -151,12 +151,13 @@ def perform_dns_lookup(qname: str, qtype: str):
         list: List of DNS answer dictionaries
     """
 
+    qname = qname.rstrip(".")
     if qtype == "SOA":
         for domain in config.get('domains', ['lxd']):
             if qname == domain or qname.endswith('.' + domain):
                 soa_config = config.get('soa', {})
-                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}')
-                admin_email = soa_config.get('admin_email', f'admin.{domain}')
+                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}').rstrip(".") + "."
+                admin_email = soa_config.get('admin_email', f'admin.{domain}').replace("@", ".").rstrip(".") + "."
                 serial = str(int(datetime.now().timestamp()))
                 refresh = soa_config.get('refresh', 3600)
                 retry = soa_config.get('retry', 1800)
@@ -167,7 +168,7 @@ def perform_dns_lookup(qname: str, qtype: str):
                 
                 response = [{
                     "qtype": "SOA",
-                    "qname": qname,
+                    "qname": qname + ".",
                     "content": soa_content,
                     "ttl": 86400,
                     "auth": True
@@ -179,7 +180,6 @@ def perform_dns_lookup(qname: str, qtype: str):
         print(f"No matching domain for SOA query: {qname}")
         return {"result": []}
 
-    qname = qname.rstrip(".")
     cname = None
     for suffix in config.get('domains', ['lxd']):
         if qname.endswith(suffix):
@@ -196,7 +196,7 @@ def perform_dns_lookup(qname: str, qtype: str):
     if qtype == "A" and (ipv4 := get_container_ip(cname, family='inet')):
         answers.append({
             "qtype": "A",
-            "qname": qname,
+            "qname": qname + ".",
             "content": ipv4,
             "ttl": 60,
             "auth": True
@@ -204,7 +204,7 @@ def perform_dns_lookup(qname: str, qtype: str):
     elif qtype == "AAAA" and (ipv6 := get_container_ip(cname, family='inet6')):
         answers.append({
             "qtype": "AAAA",
-            "qname": qname,
+            "qname": qname + ".",
             "content": ipv6,
             "ttl": 60,
             "auth": True
