@@ -208,7 +208,6 @@ def perform_dns_lookup(qname: str, qtype: str):
         
         return {"result": []}
 
-
     containers = []
     aliases = config.get('aliases', {})
     for suffix in config.get('domains', ['lxd']):
@@ -216,6 +215,7 @@ def perform_dns_lookup(qname: str, qtype: str):
             cname = qname[:-len(suffix)].rstrip(".")
             if container := get_container(cname):
                 containers.append(container)
+                alias = None
             else:
                 alias = aliases.get(cname)
             break
