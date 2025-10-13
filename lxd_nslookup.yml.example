@@ -30,3 +30,11 @@ soa:
   retry: 1800                          # Retry interval (30 minutes)
   expire: 604800                       # Expire time (1 week)
   minimum: 86400                       # Minimum TTL (1 day)
+
+# Alias configuration
+# Each item defines an alias cname and either a "pattern" (regex matching container names)
+# or an explicit list of "hosts" (container names). When a query's left-hand name
+# matches the group's cname, the service will return the IPs of all matched containers.
+aliases:
+  dbs: '^db-srv-.*'     # all containers whose name starts with db-srv-
+  web: ['web1', 'web2'] # explicit host list

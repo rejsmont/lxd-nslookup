@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 import uvicorn
 import pylxd
 import warnings
+import re
 
 warnings.filterwarnings(
     "ignore",
@@ -89,7 +90,36 @@ def is_slaac(ip):
     except ValueError:
         return False
 
-def get_container_ip(container_name, interface=None, family='inet'):
+def get_containers():
+    """
+    Retrieve all LXD containers.
+    
+    Returns:
+        list: A list of LXD container objects
+    """
+    try:
+        containers = client.containers.all()
+        return containers
+    except pylxd.exceptions.LXDAPIException as e:
+        return []
+
+def get_container(container_name):
+    """
+    Retrieve an LXD container by name.
+    
+    Args:
+        container_name (str): Name of the LXD container to retrieve
+    
+    Returns:
+        pylxd.models.Container: The LXD container object if found, None otherwise
+    """
+    try:
+        container = client.containers.get(container_name)
+        return container
+    except pylxd.exceptions.NotFound:
+        return None
+
+def get_container_ip(container, interface=None, family='inet'):
     """
     Get the IP address of a running LXD container on a specific network interface.
     
@@ -108,10 +138,6 @@ def get_container_ip(container_name, interface=None, family='inet'):
         str or None: The IP address string if found, None if container is not running
                     or no matching address is found
     
-    Raises:
-        pylxd.exceptions.NotFound: If the container does not exist
-        pylxd.exceptions.LXDAPIException: If there's an error communicating with LXD
-    
     Note:
         - Only returns addresses with scope != 'link' (excludes link-local addresses)
         - For IPv6, prefers non-SLAAC addresses over SLAAC addresses
@@ -120,9 +146,7 @@ def get_container_ip(container_name, interface=None, family='inet'):
     if interface is None:
         interface = config.get('interface', 'eth0')
     
-    try:
-        container = client.containers.get(container_name)
-    except pylxd.exceptions.NotFound:
+    if container is None:
         return None
     if not container.status.lower() == "running":
         return None
@@ -184,34 +208,52 @@ def perform_dns_lookup(qname: str, qtype: str):
         
         return {"result": []}
 
-    cname = None
+
+    containers = []
+    aliases = config.get('aliases', {})
     for suffix in config.get('domains', ['lxd']):
         if qname.endswith(suffix):
             cname = qname[:-len(suffix)].rstrip(".")
+            if container := get_container(cname):
+                containers.append(container)
+            else:
+                alias = aliases.get(cname)
             break
-    
-    if cname is None:
-        return []
-    
-    ipv4, ipv6 = None, None
+    else:
+        return {"result": []}
+
+    if isinstance(alias, list):
+        for container in get_containers():
+            if container.name in alias:
+                containers.append(container)
+    elif isinstance(alias, str):
+        try:
+            regex = re.compile(alias)
+            for container in get_containers():
+                if regex.search(container.name):
+                    containers.append(container)
+        except re.error:
+            pass
+
     answers = []
 
-    if (qtype == "A" or qtype == "ANY") and (ipv4 := get_container_ip(cname, family='inet')):
-        answers.append({
-            "qtype": "A",
-            "qname": qname + ".",
-            "content": ipv4,
-            "ttl": 60,
-            "auth": True
-        })
-    if (qtype == "AAAA" or qtype == "ANY") and (ipv6 := get_container_ip(cname, family='inet6')):
-        answers.append({
-            "qtype": "AAAA",
-            "qname": qname + ".",
-            "content": ipv6,
-            "ttl": 60,
-            "auth": True
-        })
+    for container in containers:
+        if (qtype == "A" or qtype == "ANY") and (ipv4 := get_container_ip(container, family='inet')):
+            answers.append({
+                "qtype": "A",
+                "qname": qname + ".",
+                "content": ipv4,
+                "ttl": 60,
+                "auth": True
+            })
+        if (qtype == "AAAA" or qtype == "ANY") and (ipv6 := get_container_ip(container, family='inet6')):
+            answers.append({
+                "qtype": "AAAA",
+                "qname": qname + ".",
+                "content": ipv6,
+                "ttl": 60,
+                "auth": True
+            })
 
     return {"result": answers}
 
