@@ -2,7 +2,6 @@
 
 import os
 import sys
-import json
 import logging
 from time import sleep
 import requests
@@ -62,7 +61,7 @@ class KeaClient:
             "arguments": args
         }
         try:
-            for i in range(3):
+            for _ in range(3):
                 resp = requests.post(self.api_url, auth=(self.api_user, self.api_key), headers=headers, json=payload, timeout=10)
                 if resp.status_code == 200:
                     return resp.json()[0]
@@ -248,7 +247,6 @@ def main():
     if interface not in config.get('interfaces', {}):
         sys.exit(0)
 
-    # Initialize clients from config
     lxd_cfg = config.get('lxd', {})
     lxd_endpoint = lxd_cfg.get('endpoint')
     lxd_cert = lxd_cfg.get('cert')
@@ -261,12 +259,10 @@ def main():
     pdns_cfg = config.get('pdns', {})
     pdns = PowerDNSClient(pdns_cfg.get('api_url'), pdns_cfg.get('api_key'), pdns_cfg.get('server_id'))
 
-    # Zones
     zones = config.get('zones', {})
     forward_zone = zones.get('forward')
     reverse_zone = zones.get('reverse')
 
-    # Process based on hook point
     if hook_point == "leases6_committed":
         subnet_prefix = get_subnet_prefix(config, interface)
         container, mac_addr, slaac_addr, addresses = get_container_netcfg(lxd, subnet_prefix, client_addr)
@@ -292,6 +288,7 @@ def main():
         ptr_name = address.reverse_dns
         if pdns.delete_ptr_record(reverse_zone, ptr_name):
             logger.info(f"Deleted PTR record for {ptr_name}")
+
 
 if __name__ == "__main__":
     main()
