@@ -10,8 +10,6 @@ import pylxd
 import yaml
 import netaddr
 
-from pathlib import Path
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -224,11 +222,9 @@ def get_container_netcfg(lxd, subnet_prefix, client_addr):
 def get_subnet_prefix(config, interface):
     return netaddr.IPNetwork(config.get('interfaces', {}).get(interface))
 
-# Main logic for explicit hook point
+
 def main():
-    # Collect environment variables set by kea's run_script
     hook_point = sys.argv[1] if len(sys.argv) > 1 else None
-    query_type = os.environ.get("QUERY6_TYPE")
     interface = os.environ.get("QUERY6_IFACE_NAME")
     client_addr = os.environ.get("QUERY6_REMOTE_ADDR")
     hostname = os.environ.get("LEASE6_HOSTNAME")
@@ -238,10 +234,8 @@ def main():
     if not hook_point:
         sys.exit(0)
 
-    # Load hierarchical config
     config = load_config()
 
-    # Configure logging level from config
     try:
         level = getattr(logging, config.get('log_level', 'INFO').upper(), logging.INFO)
         logger.setLevel(level)
