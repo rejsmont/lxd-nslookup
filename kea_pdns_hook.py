@@ -281,7 +281,7 @@ def main():
         hostname = str(container.name).strip('.') if container else None
         if not hostname:
             sys.exit(1)
-        if query_type == "REQUEST" and not kea.reservation_exists(slaac_addr, duid):
+        if not kea.reservation_exists(slaac_addr, duid):
             subnet_id = kea.get_subnet_id_by_prefix(subnet_prefix)
             if kea.create_reservation(subnet_id, duid, slaac_addr, container.name):
                 logger.info(f"Created reservation for {hostname} -> {slaac_addr} with DUID {duid} / MAC {mac_addr}")
