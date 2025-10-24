@@ -386,6 +386,18 @@ files = [
 all = ["flake8 (>=7.1.1)", "mypy (>=1.11.2)", "pytest (>=8.3.2)", "ruff (>=0.6.2)"]
 
 [[package]]
+name = "netaddr"
+version = "0.8.0"
+description = "A network address manipulation library for Python"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "netaddr-0.8.0-py2.py3-none-any.whl", hash = "sha256:9666d0232c32d2656e5e5f8d735f58fd6c7457ce52fc21c98d45f2af78f990ac"},
+    {file = "netaddr-0.8.0.tar.gz", hash = "sha256:d6cc57c7a07b1d9d2e917aa8b36ae8ce61c35ba3fcd1b83ca31c5a0ee2b5a243"},
+]
+
+[[package]]
 name = "pycparser"
 version = "2.23"
 description = "C parser in Python"
@@ -813,5 +825,5 @@ files = [
 
 [metadata]
 lock-version = "2.1"
-python-versions = ">=3.12"
-content-hash = "0600ee0ca26fe06e742232a23cf63a606f8b1b6f94e7d82ae0c2a9593e0d9f4d"
+python-versions = ">=3.12, <3.14"
+content-hash = "98c9533f199b885b85001bb6c0c0a0d3a99434ea2e04395853bca82df7e13571"
