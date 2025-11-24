@@ -262,6 +262,7 @@ def main():
     zones = config.get('zones', {})
     forward_zone = zones.get('forward')
     reverse_zone = zones.get('reverse')
+    mapping = config.get('mapping', {})
 
     if hook_point == "leases6_committed":
         subnet_prefix = get_subnet_prefix(config, interface)
@@ -275,7 +276,8 @@ def main():
             subnet_id = kea.get_subnet_id_by_prefix(subnet_prefix)
             if kea.create_reservation(subnet_id, duid, slaac_addr, container.name):
                 logger.info(f"Created reservation for {hostname} -> {slaac_addr} with DUID {duid} / MAC {mac_addr}")
-        fqdn = f"{hostname}.{forward_zone.strip('.')}"
+        domain = mapping.get(hostname, forward_zone.strip('.'))
+        fqdn = f"{hostname}.{domain}"
         if pdns.add_aaaa_record(forward_zone, fqdn, slaac_addr):
             logger.info(f"Added AAAA record for {fqdn} -> {slaac_addr}")
         if pdns.add_ptr_record(reverse_zone, slaac_addr.reverse_dns, fqdn):
