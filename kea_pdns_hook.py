@@ -276,10 +276,12 @@ def main():
             subnet_id = kea.get_subnet_id_by_prefix(subnet_prefix)
             if kea.create_reservation(subnet_id, duid, slaac_addr, container.name):
                 logger.info(f"Created reservation for {hostname} -> {slaac_addr} with DUID {duid} / MAC {mac_addr}")
-        domain = mapping.get(hostname, forward_zone.strip('.'))
+        domain = forward_zone.strip('.')
         fqdn = f"{hostname}.{domain}"
         if pdns.add_aaaa_record(forward_zone, fqdn, slaac_addr):
             logger.info(f"Added AAAA record for {fqdn} -> {slaac_addr}")
+        domain = mapping.get(hostname, forward_zone.strip('.'))
+        fqdn = f"{hostname}.{domain}"
         if pdns.add_ptr_record(reverse_zone, slaac_addr.reverse_dns, fqdn):
             logger.info(f"Added PTR record for {slaac_addr.reverse_dns} -> {fqdn}")
     elif hook_point == "lease6_release" and hostname and lease_address:
