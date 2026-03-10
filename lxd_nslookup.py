@@ -9,6 +9,9 @@ import uvicorn
 import pylxd
 import warnings
 import re
+import time
+from functools import lru_cache, wraps
+
 
 warnings.filterwarnings(
     "ignore",
@@ -19,6 +22,7 @@ warnings.filterwarnings(
 app = FastAPI()
 config = {}
 client = None
+
 
 def load_config(config_file):
     """
@@ -69,6 +73,27 @@ def load_config(config_file):
         verify=lxd_config.get('verify_cert', True)
     )
 
+
+def get_ttl_hash(seconds: int = 60):
+    """Return the same value within `seconds` time period"""
+    return round(time.time() / seconds)
+
+
+def ttl_cache(maxsize: int = 128, typed: bool = False, ttl: int = 60):
+    """LRU Cache decorator with TTL"""
+    def wrapper_cache(func):
+        @lru_cache(maxsize=maxsize, typed=typed)
+        def cached_func(*args, _ttl_hash, **kwargs):
+            return func(*args, **kwargs)
+        
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            return cached_func(*args, _ttl_hash=get_ttl_hash(ttl), **kwargs)
+        
+        return wrapper
+    return wrapper_cache
+
+
 def is_slaac(ip):
     """
     Check if the given IPv6 address is a SLAAC (Stateless Address Autoconfiguration) address.
@@ -90,6 +115,7 @@ def is_slaac(ip):
     except ValueError:
         return False
 
+
 def get_containers():
     """
     Retrieve all LXD containers.
@@ -102,6 +128,7 @@ def get_containers():
         return containers
     except pylxd.exceptions.LXDAPIException as e:
         return []
+
 
 def get_container(container_name):
     """
@@ -118,6 +145,7 @@ def get_container(container_name):
         return container
     except pylxd.exceptions.NotFound:
         return None
+
 
 def get_container_ip(container, interface=None, family='inet'):
     """
@@ -169,6 +197,7 @@ def get_container_ip(container, interface=None, family='inet'):
     return None
 
 
+@ttl_cache(maxsize=256, ttl=60)
 def perform_dns_lookup(qname: str, qtype: str):
     """
     Perform DNS lookup for the given query name and type.

@@ -35,11 +35,14 @@ class LXDClient:
         try:
             ip = netaddr.IPAddress(ip)
             for container in self.client.containers.all():
-                state = container.state()
-                for iface in state.network.values():
-                    addresses = [netaddr.IPAddress(a.get('address')) for a in iface.get('addresses', [])]
-                    if addresses and ip in addresses:
-                        return container, iface
+                try:
+                    state = container.state()
+                    for iface in state.network.values():
+                        addresses = [netaddr.IPAddress(a.get('address')) for a in iface.get('addresses', [])]
+                        if addresses and ip in addresses:
+                            return container, iface
+                except Exception as e:
+                    logger.error(f"Error querying {container.name} state: {e}")
             logger.info(f"No container found with address {ip}")
             return None, None
         except Exception as e:
