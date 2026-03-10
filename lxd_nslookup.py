@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import ipaddress
 import argparse
+import logging
 import sys
 import yaml
+import urllib3
 from datetime import datetime
 from fastapi import FastAPI, Request
 import uvicorn
@@ -12,12 +14,13 @@ import re
 import time
 from functools import lru_cache, wraps
 
-
 warnings.filterwarnings(
     "ignore",
     category=UserWarning,
     module="pylxd.models._model"
 )
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = FastAPI()
 config = {}
@@ -27,10 +30,10 @@ client = None
 def load_config(config_file):
     """
     Load and validate configuration from a YAML file and initialize LXD client.
-    
+
     This function reads the YAML configuration file, validates the structure,
     and initializes the global LXD client connection using the provided settings.
-    
+
     Args:
         config_file (str): Path to the YAML configuration file
 
@@ -55,17 +58,17 @@ def load_config(config_file):
             minimum: Minimum TTL in seconds (default: 86400)
     """
     global config, client
-    
+
     try:
         with open(config_file, 'r') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
-        print(f"Configuration file {config_file} not found.")
+        logging.error(f"Configuration file {config_file} not found.")
         sys.exit(1)
     except yaml.YAMLError as e:
-        print(f"Error parsing configuration file: {e}")
+        logging.error(f"Error parsing configuration file: {e}")
         sys.exit(1)
-    
+
     lxd_config = config.get('lxd_client', {})
     client = pylxd.Client(
         endpoint=lxd_config.get('endpoint'),
@@ -85,26 +88,27 @@ def ttl_cache(maxsize: int = 128, typed: bool = False, ttl: int = 60):
         @lru_cache(maxsize=maxsize, typed=typed)
         def cached_func(*args, _ttl_hash, **kwargs):
             return func(*args, **kwargs)
-        
+
         @wraps(func)
         def wrapper(*args, **kwargs):
             return cached_func(*args, _ttl_hash=get_ttl_hash(ttl), **kwargs)
-        
+
         return wrapper
     return wrapper_cache
+
 
 
 def is_slaac(ip):
     """
     Check if the given IPv6 address is a SLAAC (Stateless Address Autoconfiguration) address.
-    
+
     SLAAC addresses are automatically generated IPv6 addresses that contain the MAC address
     of the network interface. They can be identified by the presence of 'fffe' in the
     interface identifier portion of the address (bits 104-119).
-    
+
     Args:
         ip (str): IPv6 address string to check
-    
+
     Returns:
         bool: True if the address is a SLAAC address, False otherwise
     """
@@ -119,24 +123,26 @@ def is_slaac(ip):
 def get_containers():
     """
     Retrieve all LXD containers.
-    
+
     Returns:
         list: A list of LXD container objects
     """
     try:
         containers = client.containers.all()
+        logging.debug(f"Retrieved {len(containers)} containers from LXD")
         return containers
     except pylxd.exceptions.LXDAPIException as e:
+        logging.error(f"Error retrieving containers: {e}")
         return []
 
 
 def get_container(container_name):
     """
     Retrieve an LXD container by name.
-    
+
     Args:
         container_name (str): Name of the LXD container to retrieve
-    
+
     Returns:
         pylxd.models.Container: The LXD container object if found, None otherwise
     """
@@ -144,28 +150,32 @@ def get_container(container_name):
         container = client.containers.get(container_name)
         return container
     except pylxd.exceptions.NotFound:
+        logging.debug(f"Container '{container_name}' not found.")
+        return None
+    except Exception as e:
+        logging.error(f"Error retrieving container '{container_name}': {e}")
         return None
 
 
 def get_container_ip(container, interface=None, family='inet'):
     """
     Get the IP address of a running LXD container on a specific network interface.
-    
+
     This function retrieves the IP address for a container from the specified network
     interface. For IPv6 addresses, it prioritizes non-SLAAC addresses but will fall
     back to SLAAC addresses if no other IPv6 addresses are available.
-    
+
     Args:
         container_name (str): Name of the LXD container to query
         interface (str, optional): Network interface name to check for addresses.
                                  Defaults to the interface specified in config, or 'eth0'
-        family (str): Address family to filter by. Either 'inet' for IPv4 or 
+        family (str): Address family to filter by. Either 'inet' for IPv4 or
                      'inet6' for IPv6. Defaults to 'inet'
-    
+
     Returns:
         str or None: The IP address string if found, None if container is not running
                     or no matching address is found
-    
+
     Note:
         - Only returns addresses with scope != 'link' (excludes link-local addresses)
         - For IPv6, prefers non-SLAAC addresses over SLAAC addresses
@@ -173,27 +183,35 @@ def get_container_ip(container, interface=None, family='inet'):
     """
     if interface is None:
         interface = config.get('interface', 'eth0')
-    
+
     if container is None:
         return None
-    if not container.status.lower() == "running":
+    try:
+        if not container.status.lower() == "running":
+            return None
+    except Exception as e:
+        logging.error(f"Error checking container status: {e}")
         return None
 
     slaac = None
-    for addr in container.state().network.get(interface, {}).get("addresses", []):
-        if addr.get("family") != family:
-            continue
-        if addr.get("scope") == "link":
-            continue
-        ip = addr.get("address")
-        if family == 'inet6' and is_slaac(ip):
-            slaac = ip
-            continue
-        return ip
-    
+    try:
+        for addr in container.state().network.get(interface, {}).get("addresses", []):
+            if addr.get("family") != family:
+                continue
+            if addr.get("scope") == "link":
+                continue
+            ip = addr.get("address")
+            if family == 'inet6' and is_slaac(ip):
+                slaac = ip
+                continue
+            return ip
+    except Exception as e:
+        logging.error(f"Error retrieving network information for container '{container.name}': {e}")
+        return None
+
     if slaac is not None:
         return slaac
-    
+
     return None
 
 
@@ -201,11 +219,11 @@ def get_container_ip(container, interface=None, family='inet'):
 def perform_dns_lookup(qname: str, qtype: str):
     """
     Perform DNS lookup for the given query name and type.
-    
+
     Args:
         qname (str): Query name (domain name)
         qtype (str): Query type ('A', 'AAAA', 'SOA')
-    
+
     Returns:
         list: List of DNS answer dictionaries
     """
@@ -222,9 +240,9 @@ def perform_dns_lookup(qname: str, qtype: str):
                 retry = soa_config.get('retry', 1800)
                 expire = soa_config.get('expire', 604800)
                 minimum = soa_config.get('minimum', 86400)
-                
+
                 soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
-                
+
                 response = [{
                     "qtype": "SOA",
                     "qname": qname + ".",
@@ -234,7 +252,7 @@ def perform_dns_lookup(qname: str, qtype: str):
                 }]
 
                 return {"result": response}
-        
+
         return {"result": []}
 
     containers = []
@@ -291,17 +309,18 @@ def perform_dns_lookup(qname: str, qtype: str):
 async def lookup_restful(qname: str, qtype: str, request: Request = None):
     """
     RESTful GET endpoint for DNS lookup requests for LXD containers.
-    
+
     This endpoint handles DNS queries via URL path parameters, supporting
     URLs like: GET /lookup/db-srv-a1.lxd./SOA
-    
+
     Args:
         qname (str): Query name (domain name) from URL path
         qtype (str): Query type ('A', 'AAAA', 'SOA') from URL path
-    
+
     Returns:
         list: List of DNS answer dictionaries, same format as POST endpoint
     """
+
 
     return perform_dns_lookup(qname, qtype)
 
@@ -317,22 +336,29 @@ async def get_all_domain_metadata(qname: str):
     Returns:
         dict: Metadata information for the specified domain
     """
-    return {"result": []} 
+    return {"result": []}
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='LXD DNS lookup service')
-    parser.add_argument('-c', '--config', 
+    parser.add_argument('-c', '--config',
                        default='/etc/lxd_nslookup.yml',
                        help='Configuration file path (default: /etc/lxd_nslookup.yml)')
-    
+    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
+
     args = parser.parse_args()
-    
+
     load_config(args.config)
-    
+
     # Get server configuration with defaults
     server_config = config.get('server', {})
     host = server_config.get('host', '127.0.0.1')
     port = server_config.get('port', 8081)
-    
+
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG)
+        logging.info(f"Starting LXD DNS lookup service on {host}:{port} with config: {config}")
+    else:
+        logging.basicConfig(level=logging.INFO)
+        logging.info(f"Starting LXD DNS lookup service on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
