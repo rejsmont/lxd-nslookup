@@ -12,6 +12,8 @@ import pylxd
 import warnings
 import re
 import time
+import threading
+import requests.exceptions
 from functools import lru_cache, wraps
 
 warnings.filterwarnings(
@@ -25,6 +27,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = FastAPI()
 config = {}
 client = None
+_client_lock = threading.Lock()
 
 
 def load_config(config_file):
@@ -69,12 +72,47 @@ def load_config(config_file):
         logging.error(f"Error parsing configuration file: {e}")
         sys.exit(1)
 
+    _build_client()
+
+
+def _build_client():
+    """(Re)build the global pylxd client from current config."""
+    global client
     lxd_config = config.get('lxd_client', {})
-    client = pylxd.Client(
+    new_client = pylxd.Client(
         endpoint=lxd_config.get('endpoint'),
         cert=(lxd_config.get('cert_file'), lxd_config.get('key_file')),
-        verify=lxd_config.get('verify_cert', True)
+        verify=lxd_config.get('verify_cert', True),
     )
+    client = new_client
+
+
+_CONNECTION_ERRORS = (
+    pylxd.exceptions.ClientConnectionFailed,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ChunkedEncodingError,
+    ConnectionError,
+)
+
+
+def _with_lxd_retry(fn, *args, **kwargs):
+    """
+    Call fn(*args, **kwargs) against the LXD client. On connection-class
+    failures, rebuild the client exactly once and retry. Other exceptions
+    propagate unchanged.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except _CONNECTION_ERRORS as e:
+        logging.warning(f"LXD connection error ({type(e).__name__}: {e}); rebuilding client and retrying")
+        with _client_lock:
+            try:
+                _build_client()
+            except Exception as build_err:
+                logging.error(f"Failed to rebuild LXD client: {build_err}")
+                raise e from build_err
+
+        return fn(*args, **kwargs)
 
 
 def get_ttl_hash(seconds: int = 60):
@@ -97,7 +135,6 @@ def ttl_cache(maxsize: int = 128, typed: bool = False, ttl: int = 60):
     return wrapper_cache
 
 
-
 def is_slaac(ip):
     """
     Check if the given IPv6 address is a SLAAC (Stateless Address Autoconfiguration) address.
@@ -114,7 +151,7 @@ def is_slaac(ip):
     """
     try:
         addr = int(ipaddress.IPv6Address(ip))
-        shifted = addr >> (128 - 104)   # shift right by 24
+        shifted = addr >> (128 - 104)
         return (shifted & 0xFFFF) == 0xfffe
     except ValueError:
         return False
@@ -128,11 +165,14 @@ def get_containers():
         list: A list of LXD container objects
     """
     try:
-        containers = client.containers.all()
+        containers = _with_lxd_retry(lambda: client.containers.all())
         logging.debug(f"Retrieved {len(containers)} containers from LXD")
         return containers
     except pylxd.exceptions.LXDAPIException as e:
         logging.error(f"Error retrieving containers: {e}")
+        return []
+    except _CONNECTION_ERRORS as e:
+        logging.error(f"LXD unreachable after retry: {e}")
         return []
 
 
@@ -147,10 +187,12 @@ def get_container(container_name):
         pylxd.models.Container: The LXD container object if found, None otherwise
     """
     try:
-        container = client.containers.get(container_name)
-        return container
+        return _with_lxd_retry(lambda: client.containers.get(container_name))
     except pylxd.exceptions.NotFound:
         logging.debug(f"Container '{container_name}' not found.")
+        return None
+    except _CONNECTION_ERRORS as e:
+        logging.error(f"LXD unreachable after retry for '{container_name}': {e}")
         return None
     except Exception as e:
         logging.error(f"Error retrieving container '{container_name}': {e}")
@@ -187,32 +229,34 @@ def get_container_ip(container, interface=None, family='inet'):
     if container is None:
         return None
     try:
-        if not container.status.lower() == "running":
+        if container.status.lower() != "running":
             return None
     except Exception as e:
         logging.error(f"Error checking container status: {e}")
         return None
 
-    slaac = None
     try:
-        for addr in container.state().network.get(interface, {}).get("addresses", []):
-            if addr.get("family") != family:
-                continue
-            if addr.get("scope") == "link":
-                continue
-            ip = addr.get("address")
-            if family == 'inet6' and is_slaac(ip):
-                slaac = ip
-                continue
-            return ip
+        state = _with_lxd_retry(lambda: container.state())
+    except _CONNECTION_ERRORS as e:
+        logging.error(f"LXD unreachable fetching state for '{container.name}': {e}")
+        return None
     except Exception as e:
         logging.error(f"Error retrieving network information for container '{container.name}': {e}")
         return None
 
-    if slaac is not None:
-        return slaac
+    slaac = None
+    for addr in state.network.get(interface, {}).get("addresses", []):
+        if addr.get("family") != family:
+            continue
+        if addr.get("scope") == "link":
+            continue
+        ip = addr.get("address")
+        if family == 'inet6' and is_slaac(ip):
+            slaac = ip
+            continue
+        return ip
 
-    return None
+    return slaac
 
 
 @ttl_cache(maxsize=256, ttl=60)
