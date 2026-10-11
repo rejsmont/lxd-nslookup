@@ -1,408 +1,423 @@
 #!/usr/bin/env python3
-import ipaddress
+"""
+LXD -> PowerDNS remote backend (HTTP connector).
+
+Resolves <container>.<domain> to the container's IPv4/IPv6 addresses.
+
+Design:
+  * One LXD API call (GET /1.0/containers?recursion=2) returns every container
+    with its state. The result is reduced to {name: (ipv4, ipv6)} and kept as a
+    snapshot for `cache_ttl` seconds. Every lookup is then a dict lookup, and
+    LXD load is bounded to one call per `cache_ttl`, whatever the query mix.
+  * If LXD stops responding, the last good snapshot is served for up to
+    `stale_ttl` seconds. After that, lookups fail with HTTP 503, which makes
+    PowerDNS answer SERVFAIL rather than a (negatively cached) NXDOMAIN.
+  * The SOA is returned only at the zone apex, so PowerDNS sees one zone per
+    configured domain and nonexistent names get a proper NXDOMAIN.
+  * /getAllDomains returns the configured domains, so the PowerDNS zone cache
+    (zone-cache-refresh-interval > 0) works and PowerDNS stops probing
+    "<name> SOA" up the tree on every cache miss.
+  * Handlers are synchronous, so FastAPI runs them in its thread pool and a
+    slow LXD call never blocks the event loop.
+
+Configuration (YAML):
+  lxd_client:                    # omit endpoint to use the local unix socket
+    endpoint: https://...        # LXD API endpoint
+    cert_file: /path/client.crt
+    key_file: /path/client.key
+    verify_cert: true            # or path to the server certificate
+    timeout: 1.5                 # seconds; keep below the PowerDNS remote timeout
+    project: default             # LXD project holding the containers
+  server:
+    host: "::1"
+    port: 8053
+  domains: [lxd]
+  interface: eth0                # interface whose addresses are published
+  ttl: 300                       # A/AAAA record TTL
+  cache_ttl: 10                  # snapshot lifetime
+  stale_ttl: 300                 # how long to serve stale data if LXD is down
+  aliases:                       # optional
+    web: [web1, web2]            # explicit list of containers
+    db: "^db-"                   # regex matched against container names
+  soa:
+    primary_ns: ns1.lxd
+    admin_email: admin@lxd
+    ttl: 300
+    minimum: 60                  # negative-caching TTL used by resolvers
+    refresh: 3600
+    retry: 1800
+    expire: 604800
+"""
 import argparse
+import ipaddress
 import logging
-import sys
-import yaml
-import urllib3
-from datetime import datetime
-from fastapi import FastAPI, Request
-import uvicorn
-import pylxd
-import warnings
 import re
-import time
+import sys
 import threading
-import requests.exceptions
-from functools import lru_cache, wraps
+import time
+import warnings
 
-warnings.filterwarnings(
-    "ignore",
-    category=UserWarning,
-    module="pylxd.models._model"
-)
+import pylxd
+import urllib3
+import uvicorn
+import yaml
+from fastapi import FastAPI, HTTPException
 
+warnings.filterwarnings("ignore", category=UserWarning, module="pylxd.models._model")
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+log = logging.getLogger("lxd_nslookupd")
 app = FastAPI()
+
 config = {}
 client = None
-_client_lock = threading.Lock()
+domains = []     # normalised, longest first
+aliases = {}     # label -> frozenset of names | compiled regex
+snapshot = None  # Snapshot instance
 
 
-def load_config(config_file):
-    """
-    Load and validate configuration from a YAML file and initialize LXD client.
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
 
-    This function reads the YAML configuration file, validates the structure,
-    and initializes the global LXD client connection using the provided settings.
-
-    Args:
-        config_file (str): Path to the YAML configuration file
-
-    Expected Configuration Structure:
-        lxd_client:
-            endpoint: LXD server endpoint URL
-            cert_file: Path to client certificate file
-            key_file: Path to client key file
-            verify_cert: Path to server certificate or boolean for verification
-        server:
-            host: IP address to bind the server to (default: 127.0.0.1)
-            port: Port number to bind the server to (default: 8081)
-        domains:
-            - List of domain suffixes to handle (default: ['lxd'])
-        soa:
-            primary_ns: Primary nameserver for SOA record (default: ns1.{domain})
-            admin_email: Admin email for SOA record (default: admin.{domain})
-            serial: Auto-generated from current Unix timestamp
-            refresh: Refresh interval in seconds (default: 3600)
-            retry: Retry interval in seconds (default: 1800)
-            expire: Expire time in seconds (default: 604800)
-            minimum: Minimum TTL in seconds (default: 86400)
-    """
-    global config, client
+def load_config(path):
+    global config, client, domains, aliases, snapshot
 
     try:
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
+        with open(path) as f:
+            config = yaml.safe_load(f) or {}
     except FileNotFoundError:
-        logging.error(f"Configuration file {config_file} not found.")
+        log.error("Configuration file %s not found.", path)
         sys.exit(1)
     except yaml.YAMLError as e:
-        logging.error(f"Error parsing configuration file: {e}")
+        log.error("Error parsing configuration file: %s", e)
         sys.exit(1)
 
-    _build_client()
-
-
-def _build_client():
-    """(Re)build the global pylxd client from current config."""
-    global client
-    lxd_config = config.get('lxd_client', {})
-    new_client = pylxd.Client(
-        endpoint=lxd_config.get('endpoint'),
-        cert=(lxd_config.get('cert_file'), lxd_config.get('key_file')),
-        verify=lxd_config.get('verify_cert', True),
+    lxd = config.get("lxd_client", {})
+    client = pylxd.Client(
+        endpoint=lxd.get("endpoint"),
+        cert=(lxd.get("cert_file"), lxd.get("key_file")),
+        verify=lxd.get("verify_cert", True),
+        timeout=lxd.get("timeout", 1.5),
     )
-    client = new_client
 
+    domains = sorted(
+        {d.strip(".").lower() for d in config.get("domains", ["lxd"])},
+        key=len,
+        reverse=True,
+    )
 
-_CONNECTION_ERRORS = (
-    pylxd.exceptions.ClientConnectionFailed,
-    requests.exceptions.ConnectionError,
-    requests.exceptions.ChunkedEncodingError,
-    ConnectionError,
-)
-
-
-def _with_lxd_retry(fn, *args, **kwargs):
-    """
-    Call fn(*args, **kwargs) against the LXD client. On connection-class
-    failures, rebuild the client exactly once and retry. Other exceptions
-    propagate unchanged.
-    """
-    try:
-        return fn(*args, **kwargs)
-    except _CONNECTION_ERRORS as e:
-        logging.warning(f"LXD connection error ({type(e).__name__}: {e}); rebuilding client and retrying")
-        with _client_lock:
+    aliases = {}
+    for label, target in (config.get("aliases") or {}).items():
+        label = str(label).lower()
+        if isinstance(target, list):
+            aliases[label] = frozenset(str(n).lower() for n in target)
+        elif isinstance(target, str):
             try:
-                _build_client()
-            except Exception as build_err:
-                logging.error(f"Failed to rebuild LXD client: {build_err}")
-                raise e from build_err
+                aliases[label] = re.compile(target)
+            except re.error as e:
+                log.warning("Ignoring alias %r: invalid regex %r (%s)", label, target, e)
+        else:
+            log.warning("Ignoring alias %r: expected list or regex string", label)
 
-        return fn(*args, **kwargs)
+    snapshot = Snapshot(
+        max_age=float(config.get("cache_ttl", 10)),
+        stale_age=float(config.get("stale_ttl", 300)),
+    )
 
 
-def get_ttl_hash(seconds: int = 60):
-    """Return the same value within `seconds` time period"""
-    return round(time.time() / seconds)
-
-
-def ttl_cache(maxsize: int = 128, typed: bool = False, ttl: int = 60):
-    """LRU Cache decorator with TTL"""
-    def wrapper_cache(func):
-        @lru_cache(maxsize=maxsize, typed=typed)
-        def cached_func(*args, _ttl_hash, **kwargs):
-            return func(*args, **kwargs)
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return cached_func(*args, _ttl_hash=get_ttl_hash(ttl), **kwargs)
-
-        return wrapper
-    return wrapper_cache
-
+# --------------------------------------------------------------------------
+# LXD data
+# --------------------------------------------------------------------------
 
 def is_slaac(ip):
-    """
-    Check if the given IPv6 address is a SLAAC (Stateless Address Autoconfiguration) address.
-
-    SLAAC addresses are automatically generated IPv6 addresses that contain the MAC address
-    of the network interface. They can be identified by the presence of 'fffe' in the
-    interface identifier portion of the address (bits 104-119).
-
-    Args:
-        ip (str): IPv6 address string to check
-
-    Returns:
-        bool: True if the address is a SLAAC address, False otherwise
-    """
+    """True if the IPv6 address is EUI-64 based (contains ff:fe in the IID)."""
     try:
-        addr = int(ipaddress.IPv6Address(ip))
-        shifted = addr >> (128 - 104)
-        return (shifted & 0xFFFF) == 0xfffe
+        return (int(ipaddress.IPv6Address(ip)) >> 24) & 0xFFFF == 0xFFFE
     except ValueError:
         return False
 
 
-def get_containers():
+def pick_address(addresses, family):
     """
-    Retrieve all LXD containers.
-
-    Returns:
-        list: A list of LXD container objects
+    First non-link-local address of the given family.
+    For IPv6, non-SLAAC addresses win; a SLAAC address is the fallback.
     """
-    try:
-        containers = _with_lxd_retry(lambda: client.containers.all())
-        logging.debug(f"Retrieved {len(containers)} containers from LXD")
-        return containers
-    except pylxd.exceptions.LXDAPIException as e:
-        logging.error(f"Error retrieving containers: {e}")
-        return []
-    except _CONNECTION_ERRORS as e:
-        logging.error(f"LXD unreachable after retry: {e}")
-        return []
-
-
-def get_container(container_name):
-    """
-    Retrieve an LXD container by name.
-
-    Args:
-        container_name (str): Name of the LXD container to retrieve
-
-    Returns:
-        pylxd.models.Container: The LXD container object if found, None otherwise
-    """
-    try:
-        return _with_lxd_retry(lambda: client.containers.get(container_name))
-    except pylxd.exceptions.NotFound:
-        logging.debug(f"Container '{container_name}' not found.")
-        return None
-    except _CONNECTION_ERRORS as e:
-        logging.error(f"LXD unreachable after retry for '{container_name}': {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Error retrieving container '{container_name}': {e}")
-        return None
-
-
-def get_container_ip(container, interface=None, family='inet'):
-    """
-    Get the IP address of a running LXD container on a specific network interface.
-
-    This function retrieves the IP address for a container from the specified network
-    interface. For IPv6 addresses, it prioritizes non-SLAAC addresses but will fall
-    back to SLAAC addresses if no other IPv6 addresses are available.
-
-    Args:
-        container_name (str): Name of the LXD container to query
-        interface (str, optional): Network interface name to check for addresses.
-                                 Defaults to the interface specified in config, or 'eth0'
-        family (str): Address family to filter by. Either 'inet' for IPv4 or
-                     'inet6' for IPv6. Defaults to 'inet'
-
-    Returns:
-        str or None: The IP address string if found, None if container is not running
-                    or no matching address is found
-
-    Note:
-        - Only returns addresses with scope != 'link' (excludes link-local addresses)
-        - For IPv6, prefers non-SLAAC addresses over SLAAC addresses
-        - Container must be in 'running' state to return an IP address
-    """
-    if interface is None:
-        interface = config.get('interface', 'eth0')
-
-    if container is None:
-        return None
-    try:
-        if container.status.lower() != "running":
-            return None
-    except Exception as e:
-        logging.error(f"Error checking container status: {e}")
-        return None
-
-    try:
-        state = _with_lxd_retry(lambda: container.state())
-    except _CONNECTION_ERRORS as e:
-        logging.error(f"LXD unreachable fetching state for '{container.name}': {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Error retrieving network information for container '{container.name}': {e}")
-        return None
-
     slaac = None
-    for addr in state.network.get(interface, {}).get("addresses", []):
-        if addr.get("family") != family:
+    for a in addresses:
+        if a.get("family") != family or a.get("scope") == "link":
             continue
-        if addr.get("scope") == "link":
+        ip = a.get("address")
+        if not ip:
             continue
-        ip = addr.get("address")
-        if family == 'inet6' and is_slaac(ip):
-            slaac = ip
+        if family == "inet6" and is_slaac(ip):
+            slaac = slaac or ip
             continue
         return ip
-
     return slaac
 
 
-@ttl_cache(maxsize=256, ttl=60)
-def perform_dns_lookup(qname: str, qtype: str):
+def fetch_addresses():
     """
-    Perform DNS lookup for the given query name and type.
-
-    Args:
-        qname (str): Query name (domain name)
-        qtype (str): Query type ('A', 'AAAA', 'SOA')
-
-    Returns:
-        list: List of DNS answer dictionaries
+    One LXD call for all containers, including state.
+    Returns {name: (ipv4 | None, ipv6 | None)}. Stopped containers are included
+    with (None, None) so they still take precedence over aliases.
     """
+    params = {"recursion": 2}
+    project = config.get("lxd_client", {}).get("project")
+    if project:
+        params["project"] = project
+    resp = client.api.instances.get(params=params)
+    instances = resp.json().get("metadata") or []
+    iface = config.get("interface", "eth0")
 
-    qname = qname.rstrip(".")
-    if qtype == "SOA":
-        for domain in config.get('domains', ['lxd']):
-            if qname == domain or qname.endswith('.' + domain):
-                soa_config = config.get('soa', {})
-                primary_ns = soa_config.get('primary_ns', f'ns1.{domain}').rstrip(".") + "."
-                admin_email = soa_config.get('admin_email', f'admin.{domain}').replace("@", ".").rstrip(".") + "."
-                serial = str(int(datetime.now().timestamp()))
-                refresh = soa_config.get('refresh', 3600)
-                retry = soa_config.get('retry', 1800)
-                expire = soa_config.get('expire', 604800)
-                minimum = soa_config.get('minimum', 86400)
+    result = {}
+    for inst in instances:
+        if inst.get("type", "container") != "container":
+            continue
+        name = inst.get("name", "").lower()
+        if not name:
+            continue
+        if (inst.get("status") or "").lower() != "running":
+            result[name] = (None, None)
+            continue
+        network = (inst.get("state") or {}).get("network") or {}
+        addrs = (network.get(iface) or {}).get("addresses") or []
+        result[name] = (pick_address(addrs, "inet"), pick_address(addrs, "inet6"))
 
-                soa_content = f"{primary_ns} {admin_email} {serial} {refresh} {retry} {expire} {minimum}"
+    running = sum(1 for v4, v6 in result.values() if v4 or v6)
+    if not result:
+        log.warning("LXD returned no containers (project: %s). Wrong project or endpoint?",
+                    project or "default")
+    elif not running:
+        log.warning("%d containers but none has an address on '%s'. Wrong 'interface'?",
+                    len(result), iface)
+    log.debug("Snapshot refreshed: %d containers, %d with addresses", len(result), running)
+    return result
 
-                response = [{
-                    "qtype": "SOA",
-                    "qname": qname + ".",
-                    "content": soa_content,
-                    "ttl": 86400,
-                    "auth": True
-                }]
 
-                return {"result": response}
+class Snapshot:
+    """Thread-safe, time-limited copy of fetch_addresses() with stale fallback."""
 
-        return {"result": []}
+    def __init__(self, max_age, stale_age):
+        self.max_age = max_age
+        self.stale_age = stale_age
+        self._data = None
+        self._fresh_until = 0.0
+        self._stale_until = 0.0
+        self._lock = threading.Lock()
 
-    containers = []
-    aliases = config.get('aliases', {})
-    for suffix in config.get('domains', ['lxd']):
-        if qname.endswith(suffix):
-            cname = qname[:-len(suffix)].rstrip(".")
-            if container := get_container(cname):
-                containers.append(container)
-                alias = None
-            else:
-                alias = aliases.get(cname)
-            break
+    def get(self):
+        if self._data is not None and time.monotonic() < self._fresh_until:
+            return self._data
+
+        with self._lock:
+            now = time.monotonic()
+            # Another thread may have refreshed while we waited for the lock.
+            if self._data is not None and now < self._fresh_until:
+                return self._data
+            try:
+                data = fetch_addresses()
+            except Exception as e:
+                if self._data is not None and now < self._stale_until:
+                    # Serve stale data; retry no sooner than max_age from now.
+                    self._fresh_until = now + self.max_age
+                    log.warning("LXD refresh failed (%s); serving stale data", e)
+                    return self._data
+                log.error("LXD refresh failed and no usable data: %s", e)
+                raise
+            self._data = data
+            self._fresh_until = now + self.max_age
+            self._stale_until = now + self.stale_age
+            return data
+
+
+# --------------------------------------------------------------------------
+# DNS logic
+# --------------------------------------------------------------------------
+
+def split_qname(qname):
+    """(zone, label) for a name under one of our domains; label '' is the apex."""
+    for d in domains:
+        if qname == d:
+            return d, ""
+        if qname.endswith("." + d):
+            return d, qname[: -len(d) - 1]
+    return None
+
+
+def rr(qtype, qname, content, ttl):
+    return {"qtype": qtype, "qname": qname, "content": content, "ttl": ttl, "auth": True}
+
+
+def soa_record(zone, qname):
+    soa = config.get("soa", {})
+    primary_ns = soa.get("primary_ns", f"ns1.{zone}").rstrip(".") + "."
+    admin = soa.get("admin_email", f"admin.{zone}").replace("@", ".").rstrip(".") + "."
+    content = " ".join(str(x) for x in (
+        primary_ns,
+        admin,
+        int(time.time()),
+        soa.get("refresh", 3600),
+        soa.get("retry", 1800),
+        soa.get("expire", 604800),
+        soa.get("minimum", 60),
+    ))
+    return rr("SOA", qname, content, soa.get("ttl", 300))
+
+
+def lookup(qname, qtype):
+    out_name = qname.rstrip(".") + "."
+    q = out_name[:-1].lower()
+    qtype = qtype.upper()
+
+    match = split_qname(q)
+    if match is None:
+        return []
+    zone, label = match
+
+    # Zone apex: SOA only.
+    if not label:
+        return [soa_record(zone, out_name)] if qtype in ("SOA", "ANY") else []
+
+    if qtype not in ("A", "AAAA", "ANY"):
+        return []
+
+    data = snapshot.get()
+
+    if label in data:
+        names = [label]
     else:
-        return {"result": []}
+        alias = aliases.get(label)
+        if alias is None:
+            return []
+        if isinstance(alias, re.Pattern):
+            names = sorted(n for n in data if alias.search(n))
+        else:
+            names = sorted(n for n in alias if n in data)
 
-    if isinstance(alias, list):
-        for container in get_containers():
-            if container.name in alias:
-                containers.append(container)
-    elif isinstance(alias, str):
-        try:
-            regex = re.compile(alias)
-            for container in get_containers():
-                if regex.search(container.name):
-                    containers.append(container)
-        except re.error:
-            pass
-
+    ttl = config.get("ttl", 300)
     answers = []
+    for n in names:
+        v4, v6 = data[n]
+        if v4 and qtype in ("A", "ANY"):
+            answers.append(rr("A", out_name, v4, ttl))
+        if v6 and qtype in ("AAAA", "ANY"):
+            answers.append(rr("AAAA", out_name, v6, ttl))
+    return answers
 
-    for container in containers:
-        if (qtype == "A" or qtype == "ANY") and (ipv4 := get_container_ip(container, family='inet')):
-            answers.append({
-                "qtype": "A",
-                "qname": qname + ".",
-                "content": ipv4,
-                "ttl": 60,
-                "auth": True
-            })
-        if (qtype == "AAAA" or qtype == "ANY") and (ipv6 := get_container_ip(container, family='inet6')):
-            answers.append({
-                "qtype": "AAAA",
-                "qname": qname + ".",
-                "content": ipv6,
-                "ttl": 60,
-                "auth": True
-            })
 
-    return {"result": answers}
-
+# --------------------------------------------------------------------------
+# HTTP endpoints (PowerDNS remote backend, HTTP connector, RESTful mode)
+# --------------------------------------------------------------------------
 
 @app.get("/lookup/{qname:path}/{qtype}")
-async def lookup_restful(qname: str, qtype: str, request: Request = None):
-    """
-    RESTful GET endpoint for DNS lookup requests for LXD containers.
-
-    This endpoint handles DNS queries via URL path parameters, supporting
-    URLs like: GET /lookup/db-srv-a1.lxd./SOA
-
-    Args:
-        qname (str): Query name (domain name) from URL path
-        qtype (str): Query type ('A', 'AAAA', 'SOA') from URL path
-
-    Returns:
-        list: List of DNS answer dictionaries, same format as POST endpoint
-    """
+def lookup_endpoint(qname: str, qtype: str):
+    try:
+        result = lookup(qname, qtype)
+    except Exception:
+        # PowerDNS turns a failed backend call into SERVFAIL, which resolvers
+        # don't cache the way they cache NXDOMAIN.
+        raise HTTPException(status_code=503, detail="LXD unavailable")
+    log.debug("lookup %s %s -> %d records", qname, qtype, len(result))
+    return {"result": result}
 
 
-    return perform_dns_lookup(qname, qtype)
+def domain_info(zone, zone_id):
+    return {
+        "id": zone_id,
+        "zone": zone + ".",
+        "kind": "native",
+        "serial": int(time.time()),
+        "notified_serial": 0,
+        "last_check": 0,
+        "masters": [],
+    }
+
+
+# Zone list for the PowerDNS zone cache (zone-cache-refresh-interval > 0).
+# With it, PowerDNS knows the zones up front and stops probing
+# "<name> SOA" for every query to work out which zone a name belongs to.
+# Two routes, because the connector may pass include_disabled as a query
+# parameter or as a path segment depending on the PowerDNS version.
+@app.get("/getAllDomains")
+@app.get("/getAllDomains/{rest:path}")
+def get_all_domains(rest: str = ""):
+    return {"result": [domain_info(z, i) for i, z in enumerate(domains, start=1)]}
+
+
+@app.get("/getDomainInfo/{qname:path}")
+def get_domain_info(qname: str):
+    q = qname.rstrip(".").lower()
+    for i, z in enumerate(domains, start=1):
+        if z == q:
+            return {"result": domain_info(z, i)}
+    return {"result": False}
 
 
 @app.get("/getAllDomainMetadata/{qname:path}")
-async def get_all_domain_metadata(qname: str):
-    """
-    RESTful GET endpoint for retrieving all metadata for a specific domain.
-
-    Args:
-        qname (str): Query name (domain name) from URL path
-
-    Returns:
-        dict: Metadata information for the specified domain
-    """
+def get_all_domain_metadata(qname: str):
     return {"result": []}
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='LXD DNS lookup service')
-    parser.add_argument('-c', '--config',
-                       default='/etc/lxd_nslookup.yml',
-                       help='Configuration file path (default: /etc/lxd_nslookup.yml)')
-    parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
 
+# Not used by PowerDNS: shows what the daemon currently knows.
+#   curl -s 'http://[::1]:8053/status' | jq
+@app.get("/status")
+def status():
+    try:
+        data = snapshot.get()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"LXD unavailable: {e}")
+    return {
+        "domains": domains,
+        "interface": config.get("interface", "eth0"),
+        "project": config.get("lxd_client", {}).get("project") or "default",
+        "containers": {n: {"ipv4": v4, "ipv6": v6} for n, (v4, v6) in sorted(data.items())},
+    }
+
+
+@app.get("/getDomainMetadata/{qname:path}/{kind}")
+def get_domain_metadata(qname: str, kind: str):
+    return {"result": []}
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="LXD DNS lookup service")
+    parser.add_argument("-c", "--config", default="/etc/lxd_nslookup.yml",
+                        help="Configuration file path (default: /etc/lxd_nslookup.yml)")
+    parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     load_config(args.config)
 
-    # Get server configuration with defaults
-    server_config = config.get('server', {})
-    host = server_config.get('host', '127.0.0.1')
-    port = server_config.get('port', 8081)
+    server = config.get("server", {})
+    host = server.get("host", "127.0.0.1")
+    port = server.get("port", 8081)
 
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG)
-        logging.info(f"Starting LXD DNS lookup service on {host}:{port} with config: {config}")
-    else:
-        logging.basicConfig(level=logging.INFO)
-        logging.info(f"Starting LXD DNS lookup service on {host}:{port}")
-    uvicorn.run(app, host=host, port=port)
+    # Warm the snapshot so the first queries don't wait on LXD.
+    try:
+        data = snapshot.get()
+        log.info("LXD: %d containers, %d with an address on '%s'", len(data),
+                 sum(1 for v4, v6 in data.values() if v4 or v6),
+                 config.get("interface", "eth0"))
+    except Exception as e:
+        log.warning("Initial LXD fetch failed (%s); will retry on first query", e)
+
+    log.info("Starting LXD DNS lookup service on %s:%s (domains: %s)",
+             host, port, ", ".join(domains))
+    uvicorn.run(app, host=host, port=port, access_log=args.debug,
+                log_level="debug" if args.debug else "info")
+
+
+if __name__ == "__main__":
+    main()
